@@ -6,3 +6,6 @@
 *.ipr
 out/
 /__MACOSX/
+**/target/
+*.class
+**/._*
