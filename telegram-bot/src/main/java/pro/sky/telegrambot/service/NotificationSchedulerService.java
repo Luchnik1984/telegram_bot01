@@ -241,7 +241,7 @@ public class NotificationSchedulerService {
                 }
             }
         }
-        logger.info("🧹 Cleanup completed. Deleted {} completed notifications", deletedCount);
+        logger.info(" Cleanup completed. Deleted {} completed notifications", deletedCount);
     }
 
     /**
@@ -270,4 +270,3 @@ public class NotificationSchedulerService {
     }
 
 }
-
