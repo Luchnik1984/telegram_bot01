@@ -235,7 +235,7 @@ public class NotificationSchedulerService {
                 try {
                     repository.deleteById(taskId);
                     deletedCount++;
-                    logger.info("✅ Deleted completed notification ID: {} (first sent at {})", taskId, firstSentTime);
+                    logger.info(" Deleted completed notification ID: {} (first sent at {})", taskId, firstSentTime);
                 } catch (Exception e) {
                     logger.error(" Failed to delete notification ID: {}", taskId, e);
                 }
