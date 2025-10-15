@@ -7,3 +7,7 @@ DELETE FROM notification_task;
 
 -- Или сбросить автоинкремент (если нужно)
 TRUNCATE TABLE notification_task RESTART IDENTITY;
+
+-- Удалить конкретное напоминание по ID
+DELETE FROM notification_task
+WHERE id = 10;

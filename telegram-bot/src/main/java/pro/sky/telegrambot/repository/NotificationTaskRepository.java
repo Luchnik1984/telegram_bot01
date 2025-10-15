@@ -14,8 +14,9 @@ public interface NotificationTaskRepository extends JpaRepository<NotificationTa
      * @param dateTime текущее время для поиска подходящих напоминаний
      * @return список напоминаний для отправки
      */
-    @Query ("SELECT n FROM NotificationTask n WHERE n.notificationDateTime <= :dateTime")
-    List<NotificationTask> findByNotificationToSend(@Param("dateTime") LocalDateTime dateTime);
+    @Query ("SELECT n FROM NotificationTask n WHERE n.notificationDateTime <= :dateTime AND n.notificationDateTime > :previousRunTime")
+    List<NotificationTask> findByNotificationToSend(@Param("dateTime") LocalDateTime dateTime,
+                                                    @Param("previousRunTime") LocalDateTime previousRunTime);
 
     /**
      * Находит все напоминания для конкретного пользователя
@@ -38,4 +39,13 @@ public interface NotificationTaskRepository extends JpaRepository<NotificationTa
      */
     List<NotificationTask> findByNotificationDateTimeBefore(LocalDateTime dateTime);
 
+    /**
+     * Находит напоминания в указанном временном диапазоне
+     */
+    List<NotificationTask> findByNotificationDateTimeBetween(LocalDateTime searchStartTime, LocalDateTime searchEndTime);
+
+    /**
+     * Находит напоминания созданные до указанной даты
+     */
+    List<NotificationTask> findByCreatedAtBefore(LocalDateTime dateTime);
 }
