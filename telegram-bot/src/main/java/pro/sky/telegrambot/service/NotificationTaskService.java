@@ -37,10 +37,18 @@ public class NotificationTaskService {
 
     public ParseResult parseAndSaveNotification(String messageText, long chatId) {
         logger.info("Attempting to parse message: '{}' for chat: {}", messageText, chatId);
+        if (messageText == null || messageText.trim().isEmpty()) {
+            return ParseResult.error("Сообщение не может быть пустым!");
+        }
+
         Matcher matcher = PATTERN.matcher(messageText);
 
         if (!matcher.matches()) {
             logger.warn("Message does not match pattern: '{}'", messageText);
+
+            if (messageText.matches("\\d{2}\\.\\d{2}\\.\\d{4}\\s\\d{2}:\\d{2}")) {
+                return ParseResult.error("Текст напоминания не может быть пустым! Добавьте текст после даты.");
+            }
             return ParseResult.error("Неверный формат сообщения!");
         }
 
@@ -73,7 +81,7 @@ public class NotificationTaskService {
                 // Проверяем, что дата не в прошлом
                 LocalDateTime now = LocalDateTime.now();
                 logger.info("Current time: {}", now);
-                if (notificationDateTime.isBefore(LocalDateTime.now())){
+                if (notificationDateTime.isBefore(now)){
                     logger.warn("Date is in the past: {} < {}", notificationDateTime, now);
                     return ParseResult.error("Нельзя создать напоминание в прошлом!");
                 }
