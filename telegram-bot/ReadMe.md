@@ -27,9 +27,4 @@ Copy-Item configuration.env.example config.env.dev
 
 # 2. Отредактируйте .env файл
 # Отредактируйте файл с вашими настройками:
-notepad config.env.dev  # или используйте любой текстовый редактор
-
-
-
-
-
+notepad config.env.dev  # или используйте любой текстовый редактор 
