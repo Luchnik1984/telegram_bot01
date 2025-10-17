@@ -1,4 +1,10 @@
 databaseChangeLog:
-  - include: 
-      file: /changes/create-notification-task-table.sql
+  - include:
+      file: db/changelog/changes/001-initial-schema.sql
+      relativeToChangelogFile: true
+  - include:
+      file: db/changelog/changes/002-add-indexes.sql
+      relativeToChangelogFile: true
+  - include:
+      file: db/changelog/changes/003-add-enum-types.sql
       relativeToChangelogFile: true

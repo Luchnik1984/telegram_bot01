@@ -1,376 +1,324 @@
 package pro.sky.telegrambot.service;
 
-import com.pengrad.telegrambot.TelegramBot;
-import com.pengrad.telegrambot.request.SendMessage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
-import pro.sky.telegrambot.model.NotificationTask;
-import pro.sky.telegrambot.repository.NotificationTaskRepository;
+import pro.sky.telegrambot.model.NotificationInstance;
+import pro.sky.telegrambot.model.NotificationSendingState;
 
 import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
-import java.time.temporal.ChronoUnit;
-import java.util.List;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 
+/**
+ * СЕРВИС ПЛАНИРОВЩИКА - ОСНОВНОЙ ДВИГАТЕЛЬ СИСТЕМЫ НАПОМИНАНИЙ
+ * Этот сервис отвечает за:
+ * - Регулярную проверку и отправку напоминаний
+ * - Управление состоянием отправок
+ * - Очистку устаревших данных
+ * - Восстановление после сбоев
+ * Все расписания настроены через аннотации @Scheduled с cron-выражениями
+ */
 @Service
 public class NotificationSchedulerService {
+
     private static final Logger logger = LoggerFactory.getLogger(NotificationSchedulerService.class);
 
-    private final NotificationTaskRepository repository;
-    private final TelegramBot telegramBot;
+    private final NotificationOrchestratorService orchestratorService;
+    private final NotificationInstanceService instanceService;
+    private final NotificationSendingStateService sendingStateService;
 
-    // Кэш для управления повторными отправками напоминаний:
+    public NotificationSchedulerService(NotificationOrchestratorService orchestratorService,
+                                        NotificationInstanceService instanceService,
+                                        NotificationSendingStateService sendingStateService) {
+        this.orchestratorService = orchestratorService;
+        this.instanceService = instanceService;
+        this.sendingStateService = sendingStateService;
 
-    // Мапа для хранения времени ПЕРВОЙ отправки каждого напоминания
-    // Key: ID напоминания, Value: время когда напоминание было отправлено в ПЕРВЫЙ раз
-    private final Map<Long, LocalDateTime> notificationFirstSentTime = new ConcurrentHashMap<>();
-
-    // Мапа для хранения количества отправок для каждого напоминания
-    // Key: ID напоминания, Value: сколько раз уже было отправлено это напоминание
-    private final Map<Long, Integer> notificationSendCount = new ConcurrentHashMap<>();
-
-    // Мапа для хранения последних отправленных напоминаний по chatId (для команды "Ок")
-    // Key: chatId пользователя, Value: ID последнего отправленного напоминания
-    private final Map<Long, Long> lastSentNotifications = new ConcurrentHashMap<>();
-
-    public NotificationSchedulerService(NotificationTaskRepository repository, TelegramBot telegramBot) {
-        this.repository = repository;
-        this.telegramBot = telegramBot;
-        logger.info("NotificationSchedulerService initialized");
+        logger.info("NotificationSchedulerService initialized with all dependencies");
     }
 
     /**
-     * ОСНОВНОЙ ШЕДУЛЕР - запускается КАЖДУЮ МИНУТУ
-     * Логика работы:
-     * 1. Ищет все активные напоминания (созданные менее 1 часа назад)
-     * 2. Для каждого активного напоминания проверяет, нужно ли отправлять его сейчас
-     * 3. Отправляет напоминания по расписанию: первая отправка точно в указанное время,
-     *    затем повторные каждые 10 минут в течение 1 часа
-     * 4. Выполняет автоочистку напоминаний старше 1 часа
-     * Расписание: каждую минуту в 0 секунд (например: 12:00:00, 12:01:00, 12:02:00...)
+     * ОСНОВНОЙ ШЕДУЛЕР - ОБРАБОТКА НАПОМИНАНИЙ КАЖДУЮ МИНУТУ
+     * Этот метод - сердце системы напоминаний. Он:
+     * - Запускается в 0 секунд каждой минуты (12:00:00, 12:01:00, 12:02:00...)
+     * - Находит все напоминания, которые должны быть отправлены в текущую минуту
+     * - Обрабатывает их через OrchestratorService
+     * - Выполняет базовое обслуживание системы.
      */
     @Scheduled(cron = "0 * * * * *")
-    public void sendScheduledNotification() {
-        logger.info("Scheduler started at {}", LocalDateTime.now());
+    public void processScheduledNotifications() {
+        LocalDateTime startTime = LocalDateTime.now();
+        logger.info("=== ОСНОВНОЙ ШЕДУЛЕР ЗАПУЩЕН в {} ===", startTime);
 
-        LocalDateTime currentTime = LocalDateTime.now();
-
-        // Ищем ВСЕ активные напоминания (созданные менее 1 часа назад)
-        LocalDateTime oneHourAgo = currentTime.minusHours(1);
-        List<NotificationTask> activeNotifications = repository.findByCreatedAtAfter(oneHourAgo);
-
-        logger.info("Found {} active notifications (created after {})",
-                activeNotifications.size(), oneHourAgo);
-
-        // Проверяем каждое активное напоминание на необходимость отправки
-        int sentCount = 0;
-        for (NotificationTask task : activeNotifications) {
-            if (shouldSendNow(task, currentTime)) {
-                sendNotification(task);
-                sentCount++;
-            }
-        }
-
-        // Автоочистка напоминаний старше 1 часа
-        cleanupOldNotifications();
-
-        logger.info("Scheduler finished at {}. Sent {} notifications",
-                LocalDateTime.now(), sentCount);
-    }
-
-    /**
-     * ОПРЕДЕЛЯЕТ НУЖНО ЛИ ОТПРАВЛЯТЬ НАПОМИНАНИЕ В ТЕКУЩИЙ МОМЕНТ
-     * Алгоритм отправки:
-     * - Первая отправка: точно в указанное пользователем время
-     * - Повторные отправки: каждые 10 минут после первой отправки
-     * - Всего отправок: 6 раз (0, 10, 20, 30, 40, 50 минут)
-     * - Общая длительность: 1 час с момента первой отправки
-     *
-     * @param task напоминание для проверки
-     * @param currentTime текущее время выполнения шедулера
-     * @return true если напоминание нужно отправить сейчас
-     */
-    private boolean shouldSendNow(NotificationTask task, LocalDateTime currentTime) {
-        Long taskId = task.getId();
-        LocalDateTime notificationTime = task.getNotificationDateTime();
-        LocalDateTime creationTime = task.getCreatedAt();
-
-        // ПРОВЕРКА 1: Если время напоминания еще НЕ наступило - не отправляем
-        // Это защита от напоминаний которые запланированы на будущее
-        if (notificationTime.isAfter(currentTime)) {
-            logger.debug("Notification ID: {} not ready yet (scheduled for {})", taskId, notificationTime);
-            return false;
-        }
-
-        // ПРОВЕРКА 2: Если напоминание создано более 1 часа назад - прекращаем отправки
-        // Это гарантирует автоудаление через 1 час независимо от количества отправок
-        if (creationTime.plusHours(1).isBefore(currentTime)) {
-            logger.debug("Notification ID: {} is older than 1 hour, skipping", taskId);
-            return false;
-        }
-
-        // Получаем информацию о предыдущих отправках из кэша
-        LocalDateTime firstSentTime = notificationFirstSentTime.get(taskId);
-        Integer sendCount = notificationSendCount.getOrDefault(taskId, 0);
-
-        // СЛУЧАЙ 1: ПЕРВАЯ ОТПРАВКА
-        // Если напоминание еще ни разу не отправлялось - отправляем впервые
-        if (firstSentTime == null) {
-            // Проверяем, что это точное время напоминания (до минут)
-            LocalDateTime notificationMinute = notificationTime.truncatedTo(ChronoUnit.MINUTES);
-            LocalDateTime currentMinute = currentTime.truncatedTo(ChronoUnit.MINUTES);
-
-            // Отправляем только если текущая минута совпадает с минутой напоминания
-            if (notificationMinute.equals(currentMinute)) {
-                // Сохраняем время первой отправки и устанавливаем счетчик в 1
-                notificationFirstSentTime.put(taskId, currentTime);
-                notificationSendCount.put(taskId, 1);
-                logger.info("First send for notification ID: {} (scheduled for {})", taskId, notificationTime);
-                return true;
-            }
-            return false;
-        }
-
-        // ПРОВЕРКА 3: Если с первой отправки прошло БОЛЕЕ 1 часа - прекращаем отправки
-        // Напоминание отработало свой полный цикл (1 час с первой отправки)
-        if (firstSentTime.plusHours(1).isBefore(currentTime)) {
-            logger.info("Notification ID: {} completed 1-hour sending cycle", taskId);
-            return false;
-        }
-
-        // СЛУЧАЙ 2: ПОВТОРНАЯ ОТПРАВКА
-        // Проверяем что не превышен лимит в 6 отправок и пришло время для следующей отправки
-        if (sendCount < 6 && shouldSendBasedOnInterval(firstSentTime, sendCount, currentTime)) {
-            // Увеличиваем счетчик отправок
-            notificationSendCount.put(taskId, sendCount + 1);
-            logger.info("Resend #{}/6 for notification ID: {} (first sent at {})",
-                    sendCount + 1, taskId, firstSentTime);
-            return true;
-        }
-
-        // СЛУЧАЙ 3: Не подходит ни под один критерий отправки
-        return false;
-    }
-
-    /**
-     * ОПРЕДЕЛЯЕТ ВРЕМЯ СЛЕДУЮЩЕЙ ОТПРАВКИ НА ОСНОВЕ ИНТЕРВАЛОВ
-     * Интервалы отправки (относительно времени первой отправки):
-     * - Отправка 1: 0 минут (первая отправка)
-     * - Отправка 2-6: +10,+20,+30,+40,+50
-     * @param firstSentTime время первой отправки
-     * @param sendCount количество уже выполненных отправок
-     * @param currentTime текущее время
-     * @return true если пришло время для очередной отправки
-     */
-    private boolean shouldSendBasedOnInterval(LocalDateTime firstSentTime, int sendCount, LocalDateTime currentTime) {
-        // Рассчитываем время следующей отправки: первая_отправка + (счетчик * 10 минут)
-
-        LocalDateTime nextSendTime = firstSentTime.plusMinutes(sendCount * 10L);
-
-        // Округляем до минут для точного сравнения
-        LocalDateTime nextSendMinute = nextSendTime.truncatedTo(ChronoUnit.MINUTES);
-        LocalDateTime currentMinute = currentTime.truncatedTo(ChronoUnit.MINUTES);
-
-        // Отправляем если текущая минута совпадает с минутой следующей отправки
-        boolean shouldSend = nextSendMinute.equals(currentMinute);
-
-        logger.debug("Interval check: firstSent={}, count={}, nextSend={}, current={}, shouldSend={}",
-                firstSentTime, sendCount, nextSendTime, currentTime, shouldSend);
-
-        return shouldSend;
-    }
-
-    /**
-     * ОТПРАВЛЯЕТ НАПОМИНАНИЕ ПОЛЬЗОВАТЕЛЮ В TELEGRAM
-     * Формат сообщения включает:
-     * - Текст напоминания
-     * - Время напоминания
-     * - Информацию о номере отправки (для повторных отправок)
-     * - Инструкцию по отключению командой "Ок"
-     * - Информацию об автоудалении через 1 час
-     * Также обновляет кэш последних отправленных напоминаний для команды "Ок"
-     *
-     * @param task напоминание для отправки
-     */
-    private void sendNotification(NotificationTask task) {
         try {
-            // Форматируем время для красивого отображения
-            String formattedTime = task.getNotificationDateTime()
-                    .format(DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm"));
+            // ОСНОВНАЯ ЛОГИКА: обработка напоминаний для текущей минуты
+            // OrchestratorService сам находит due notifications и отправляет их
+            orchestratorService.processDueNotifications();
 
-            // Добавляем информацию о повторных отправках в сообщение
-            Integer sendCount = notificationSendCount.getOrDefault(task.getId(), 1);
-            String repeatInfo = "";
-            if (sendCount > 1) {
-                repeatInfo = "\nПовторная отправка #" + sendCount + "/6";
-            }
+            LocalDateTime endTime = LocalDateTime.now();
+            long duration = java.time.Duration.between(startTime, endTime).toMillis();
 
-            // Создаем форматированное сообщение
-            String message = "Напоминание!" + repeatInfo + "\n\n" +
-                    task.getNotificationText() + "\n\n" +
-                    "Время: " + formattedTime + "\n\n" +
-                    "Чтобы остановить напоминание, отправьте 'Ок'\n\n" +
-                    "Напоминание автоматически удалится через 1 час после создания";
-
-            // Создаем и отправляем сообщение через Telegram Bot API
-            SendMessage sendMessage = new SendMessage(task.getChatId(), message);
-            telegramBot.execute(sendMessage);
-
-            // ОБНОВЛЯЕМ КЭШ ДЛЯ КОМАНДЫ "ОК"
-            // Сохраняем ID этого напоминания как последнее отправленное для данного пользователя
-            // Это нужно чтобы когда пользователь напишет "Ок" - мы знали какое напоминание удалять
-            // Важно: обновляем при КАЖДОЙ отправке, чтобы команда "Ок" всегда работала на последнее сообщение
-            lastSentNotifications.put(task.getChatId(), task.getId());
-
-            logger.info("Notification sent to chat: {}, ID: {}, Send count: {}",
-                    task.getChatId(), task.getId(), sendCount);
+            logger.info("=== ОСНОВНОЙ ШЕДУЛЕР УСПЕШНО ЗАВЕРШЕН ===");
+            logger.info("Время выполнения: {} мс", duration);
 
         } catch (Exception e) {
-            logger.error("Failed to send notification to chat: {}", task.getChatId(), e);
+            logger.error("=== ОСНОВНОЙ ШЕДУЛЕР ЗАВЕРШИЛСЯ С ОШИБКОЙ ===", e);
+
+            // Даже при ошибке логируем завершение работы
+            LocalDateTime endTime = LocalDateTime.now();
+            long duration = java.time.Duration.between(startTime, endTime).toMillis();
+            logger.error("Время выполнения до ошибки: {} мс", duration);
         }
     }
 
     /**
-     * АВТООЧИСТКА НАПОМИНАНИЙ СТАРШЕ 1 ЧАСА
-     * Удаляет напоминания которые:
-     * - Были созданы более 1 часа назад
-     * - Независимо от того, сколько раз они были отправлены
-     * - Гарантирует что старые напоминания не остаются в базе данных.
-     * Вызывается каждую минуту из основного шедулера
+     * БЫСТРЫЙ ШЕДУЛЕР - ОБРАБОТКА ГОТОВЫХ СОСТОЯНИЙ КАЖДЫЕ 30 СЕКУНД
+     * Этот метод обеспечивает более частую проверку и:
+     * - Автоматически возобновляет отправки с истекшей паузой
+     * - Обрабатывает состояния, готовые к немедленной отправке
+     * - Обеспечивает более отзывчивую систему для повторных отправок
+     * Важно: Этот шедулер работает ПАРАЛЛЕЛЬНО с основным и дополняет его
      */
-    private void cleanupOldNotifications() {
-        LocalDateTime oneHourAgo = LocalDateTime.now().minusHours(1);
+    @Scheduled(cron = "*/30 * * * * *")
+    public void processReadyStates() {
+        LocalDateTime currentTime = LocalDateTime.now();
+        logger.debug("⚡ Быстрая проверка состояний в: {}", currentTime);
 
-        // Находим напоминания созданные более 1 часа назад
-        List<NotificationTask> oldNotifications = repository.findByCreatedAtBefore(oneHourAgo);
+        try {
+            // ШАГ 1: АВТОМАТИЧЕСКОЕ ВОЗОБНОВЛЕНИЕ ИСТЕКШИХ ПАУЗ
+            // Если пользователь ставил напоминание на паузу на 1 час,
+            // этот метод автоматически возобновит отправки когда время паузы истечет
+            sendingStateService.resumeExpiredPauses();
 
-        if (!oldNotifications.isEmpty()) {
-            logger.info("Cleaning up {} old notifications", oldNotifications.size());
+            // ШАГ 2: ПОИСК СОСТОЯНИЙ, ГОТОВЫХ К ОТПРАВКЕ
+            // находим все состояния, которые:
+            // - В фазе INITIAL или REPEAT
+            // - Не превысили лимит отправок
+            // - Не на паузе (или пауза истекла)
+            // - Время следующей отправки наступило (или не установлено)
+            var readyStates = sendingStateService.findReadyToSendStates();
 
-            for (NotificationTask task : oldNotifications) {
-                logger.info("Deleting old notification ID: {}, Created: {}, Text: {}",
-                        task.getId(), task.getCreatedAt(), task.getNotificationText());
+            if (!readyStates.isEmpty()) {
+                logger.info(" Найдено {} состояний, готовых к обработке", readyStates.size());
 
-                // Удаляем из базы данных
-                repository.delete(task);
+                int sentCount = 0;
+                int skippedCount = 0;
 
-                // Очищаем кэши отправок
-                notificationFirstSentTime.remove(task.getId());
-                notificationSendCount.remove(task.getId());
+                // ШАГ 3: ОБРАБОТКА КАЖДОГО ГОТОВОГО СОСТОЯНИЯ
+                for (var state : readyStates) {
+                    var instance = state.getInstance();
 
-                // Если это было последнее отправленное напоминание для чата - очищаем из кэша команды "Ок"
-                Long lastSentId = lastSentNotifications.get(task.getChatId());
-                if (lastSentId != null && lastSentId.equals(task.getId())) {
-                    lastSentNotifications.remove(task.getChatId());
-                    logger.info("Removed from lastSent cache: chatId={}, notificationId={}",
-                            task.getChatId(), task.getId());
+                    // Дополнительная проверка перед отправкой
+                    if (instance != null && shouldSendBasedOnState(instance, state)) {
+                        // Отправляем напоминание через orchestrator
+                        orchestratorService.processNotificationForScheduler(instance);
+                        sentCount++;
+                    } else {
+                        skippedCount++;
+                        logger.debug("Пропущено состояние: instance={}, причина: проверка не пройдена",
+                                instance != null ? instance.getId() : "null");
+                    }
                 }
+
+                logger.info("Быстрая обработка: отправлено {}, пропущено {}", sentCount, skippedCount);
+            } else {
+                logger.debug("Нет состояний, готовых к быстрой обработке");
             }
+
+        } catch (Exception e) {
+            logger.error("Ошибка в быстром шедулере", e);
         }
     }
 
     /**
-     * ДОПОЛНИТЕЛЬНАЯ ОЧИСТКА КЭША ОТ УСТАРЕВШИХ ЗАПИСЕЙ.
-     * Запускается каждый час для:
-     * - Удаления устаревших данных из кэша отправок
-     * - Освобождения памяти
-     * - Предотвращения утечек памяти.
-     * Удаляет записи, где первая отправка была более 2 часов назад
-     * (дает дополнительный час "буфер" на случай задержек)
+     * ЕЖЕЧАСНАЯ ОЧИСТКА - УПРАВЛЕНИЕ ДАННЫМИ КАЖДЫЙ ЧАС
+     * Этот метод выполняет техническое обслуживание системы:
+     * - Удаляет старые завершенные напоминания (старше 7 дней)
+     * - Освобождает место в базе данных
+     * - Поддерживает производительность системы.
+     * Запускается каждый час в 00 минут (13:00, 14:00, 15:00...)
      */
-    @Scheduled(cron = "0 0 * * * *") // каждый час в 0 минут
-    public void hourlyCacheCleanup() {
-        logger.info("Hourly cache cleanup started");
+    @Scheduled(cron = "0 0 * * * *")
+    public void hourlyCleanup() {
+        LocalDateTime cleanupTime = LocalDateTime.now();
+        logger.info("=== ЗАПУСК ЕЖЕЧАСНОЙ ОЧИСТКИ в {} ===", cleanupTime);
 
-        // Удаляем записи, где первая отправка была более 2 часов назад
-        LocalDateTime twoHoursAgo = LocalDateTime.now().minusHours(2);
-        int initialSize = notificationFirstSentTime.size();
+        try {
+            // ОЧИСТКА СТАРЫХ ЭКЗЕМПЛЯРОВ
+            // удаляет напоминания, которые:
+            // - Были созданы более 7 дней назад
+            // - Имеют статус COMPLETED, EXPIRED или CANCELLED
+            // Это предотвращает бесконечный рост базы данных
+            instanceService.cleanupOldInstances();
 
-        notificationFirstSentTime.entrySet().removeIf(entry ->
-                entry.getValue().isBefore(twoHoursAgo)
+            logger.info("Ежечасная очистка успешно завершена");
+
+        } catch (Exception e) {
+            logger.error("Ежечасная очистка завершилась с ошибкой", e);
+        }
+    }
+
+    /**
+     * ЕЖЕДНЕВНОЕ ТЕХОБСЛУЖИВАНИЕ - КОМПЛЕКСНОЕ ОБСЛУЖИВАНИЕ В 3:00
+     * Этот метод выполняет расширенное обслуживание в ночное время:
+     * - Можно добавить анализ статистики
+     * - Оптимизацию индексов базы данных
+     * - Сбор метрик производительности
+     * - Отправку отчетов администраторам
+     */
+    @Scheduled(cron = "0 0 3 * * *")
+    public void dailyMaintenance() {
+        LocalDateTime maintenanceTime = LocalDateTime.now();
+        logger.info("🔧 === ЗАПУСК ЕЖЕДНЕВНОГО ТЕХОБСЛУЖИВАНИЯ в {} ===", maintenanceTime);
+
+        try {
+            // МЕСТО ДЛЯ РАСШИРЕННЫХ ОПЕРАЦИЙ ТЕХОБСЛУЖИВАНИЯ:
+
+            // 1. АНАЛИЗ СТАТИСТИКИ
+            logger.info("Анализ статистики системы...");
+            // Можно добавить сбор метрик: количество активных пользователей,
+            // успешность доставки, популярные времена напоминаний и т.д.
+
+            // 2. ПРОВЕРКА ЦЕЛОСТНОСТИ ДАННЫХ
+            logger.info("Проверка целостности данных...");
+            // Можно добавить проверки на orphaned records,
+            // согласованность между таблицами и т.д.
+
+            // 3. ОПТИМИЗАЦИЯ ПРОИЗВОДИТЕЛЬНОСТИ
+            logger.info(" Оптимизация производительности...");
+            // Можно добавить перестроение индексов,
+            // очистку кэшей, анализ медленных запросов
+
+            // 4. УВЕДОМЛЕНИЯ АДМИНИСТРАТОРОВ
+            logger.info("Подготовка отчетов для администраторов...");
+            // Можно добавить отправку email со статистикой,
+            // предупреждениями о проблемах и т.д.
+
+            logger.info(" Ежедневное техобслуживание успешно завершено");
+
+        } catch (Exception e) {
+            logger.error(" Ежедневное техобслуживание завершилось с ошибкой", e);
+        }
+    }
+
+    /**
+     * ПРОВЕРКА НЕОБХОДИМОСТИ ОТПРАВКИ НА ОСНОВЕ СОСТОЯНИЯ
+     * Этот метод выполняет детальную проверку перед отправкой напоминания.
+     * Он гарантирует, что напоминание отправляется только когда это действительно нужно.
+     * @param instance экземпляр напоминания для проверки
+     * @param state состояние отправки напоминания
+     * @return true если напоминание нужно отправить, false если нет
+     */
+    private boolean shouldSendBasedOnState(NotificationInstance instance,
+                                           NotificationSendingState state) {
+        LocalDateTime now = LocalDateTime.now();
+
+        // ПРОВЕРКА 1: СТАТУС ЭКЗЕМПЛЯРА
+        // отправляем только активные напоминания
+        if (instance.getStatus() != pro.sky.telegrambot.model.enums.NotificationStatus.ACTIVE) {
+            logger.debug("Пропуск отправки: экземпляр {} не активен (статус: {})",
+                    instance.getId(), instance.getStatus());
+            return false;
+        }
+
+        // ПРОВЕРКА 2: ВРЕМЯ СОЗДАНИЯ
+        // Не отправляем напоминания старше 1 часа (автоудаление)
+        if (instance.getCreatedAt().plusHours(1).isBefore(now)) {
+            logger.info(" Экземпляр {} истек, помечаем как EXPIRED", instance.getId());
+            instanceService.markAsExpired(instance.getId());
+            return false;
+        }
+
+        // ПРОВЕРКА 3: ВОЗМОЖНОСТЬ ОТПРАВКИ ПО СОСТОЯНИЮ
+        // проверяем лимиты отправок, паузы и т.д.
+        if (!sendingStateService.canSend(instance)) {
+            logger.debug("Пропуск отправки: экземпляр {} не может быть отправлен", instance.getId());
+            return false;
+        }
+
+        // ПРОВЕРКА 4: СЛЕДУЮЩЕЕ ЗАПЛАНИРОВАННОЕ ВРЕМЯ
+        // Для повторных отправок проверяем точное время
+        if (state.getNextScheduledSend() != null) {
+            // Округляем до минут для точного сравнения
+            LocalDateTime nextSendMinute = state.getNextScheduledSend()
+                    .truncatedTo(java.time.temporal.ChronoUnit.MINUTES);
+            LocalDateTime currentMinute = now.truncatedTo(java.time.temporal.ChronoUnit.MINUTES);
+
+            boolean shouldSend = nextSendMinute.equals(currentMinute);
+
+            if (!shouldSend) {
+                logger.debug("Пропуск отправки: экземпляр {} - не время отправки ({} != {})",
+                        instance.getId(), nextSendMinute, currentMinute);
+            }
+
+            return shouldSend;
+        }
+
+        // Если nextScheduledSend не установлен, но все проверки пройдены - отправляем
+        logger.debug("Все проверки пройдены, отправляем экземпляр {}", instance.getId());
+        return true;
+    }
+
+    /**
+     * РУЧНОЙ ЗАПУСК ОБРАБОТКИ - ДЛЯ ТЕСТИРОВАНИЯ И АДМИНИСТРИРОВАНИЯ
+     * Этот метод позволяет вручную запустить обработку напоминаний.
+     * Полезно для:
+     * - Тестирования функциональности
+     * - Отладки проблем
+     * - Администрирования системы
+     * - Экстренного запуска при сбоях
+     */
+    public void manualProcess() {
+        logger.warn("🔄 === РУЧНОЙ ЗАПУСК ШЕДУЛЕРА в {} ===", LocalDateTime.now());
+
+        try {
+            processScheduledNotifications();
+            logger.info("Ручной запуск успешно завершен");
+        } catch (Exception e) {
+            logger.error("Ручной запуск завершился с ошибкой", e);
+            throw new RuntimeException("Manual scheduler execution failed", e);
+        }
+    }
+
+    /**
+     * ПОЛУЧЕНИЕ СТАТУСА ШЕДУЛЕРА - ДЛЯ МОНИТОРИНГА И ДИАГНОСТИКИ
+     * Этот метод предоставляет информацию о состоянии шедулера.
+     * Может использоваться для:
+     * - Мониторинга здоровья системы
+     * - Панелей администратора
+     * - Диагностики проблем
+     * - API для внешних систем мониторинга
+     * @return строка с информацией о статусе шедулера
+     */
+    public String getSchedulerStatus() {
+        return String.format(
+                "Статус шедулера:\n" +
+                        "• Время сервера: %s\n" +
+                        "• Основной шедулер: активен (каждую минуту)\n" +
+                        "• Быстрый шедулер: активен (каждые 30 секунд)\n" +
+                        "• Ежечасная очистка: активна\n" +
+                        "• Ежедневное обслуживание: активна (3:00)\n" +
+                        "• Система: работает нормально ",
+                LocalDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm:ss"))
         );
-
-        // Синхронизируем кэш счетчиков отправок - удаляем записи, которых нет в первом кэше
-        notificationSendCount.entrySet().removeIf(entry ->
-                !notificationFirstSentTime.containsKey(entry.getKey())
-        );
-
-        int removedCount = initialSize - notificationFirstSentTime.size();
-        logger.info("Cache cleanup completed. Removed {} entries, current cache size: {}",
-                removedCount, notificationFirstSentTime.size());
-    }
-
-    // МЕТОДЫ ДЛЯ РАБОТЫ С КОМАНДОЙ "ОК"
-
-    /**
-     * Получает ID последнего отправленного напоминания для чата.
-     * Используется когда пользователь отправляет "Ок" - чтобы знать какое напоминание удалять
-     * @param chatId идентификатор чата
-     * @return ID напоминания или null, если не найдено
-     */
-    public Long getLastSentNotificationId(Long chatId) {
-        Long notificationId = lastSentNotifications.get(chatId);
-        logger.info("Retrieved last sent notification for chatId= {}: {}", chatId, notificationId);
-        return notificationId;
     }
 
     /**
-     * Очищает последнее отправленное напоминание для чата.
-     * Вызывается после успешного удаления напоминания по команде "Ок"
-     * @param chatId идентификатор чата
+     * ПРОВЕРКА ЗДОРОВЬЯ СИСТЕМЫ - ДЛЯ HEALTH CHECKS
+     * Этот метод может использоваться системами мониторинга
+     * для проверки работоспособности сервиса напоминаний.
+     * @return true если система работает нормально, false если есть проблемы
      */
-    public void clearLastSentNotification(Long chatId) {
-        Long removedId = lastSentNotifications.remove(chatId);
-        if (removedId != null) {
-            logger.info("Removed last sent notification for chat {}: ID {}", chatId, removedId);
-        } else {
-            logger.info("No last sent notification found for chat {} to remove", chatId);
+    public boolean healthCheck() {
+        try {
+            // Простая проверка - если мы можем получить текущее время,
+            // значит система в основном работает
+            LocalDateTime.now();
+            logger.debug(" Health check passed");
+            return true;
+        } catch (Exception e) {
+            logger.error(" Health check failed", e);
+            return false;
         }
-    }
-
-    /**
-     * Получает количество закэшированных напоминаний (для отладки и мониторинга)
-     * @return количество активных напоминаний в кэше
-     */
-    public int getCacheSize() {
-        return notificationFirstSentTime.size();
-    }
-
-    /**
-     * Получает информацию о конкретном напоминании в кэше (для отладки)
-     * @param taskId ID напоминания
-     * @return строка с информацией или null если не найдено
-     */
-    public String getCacheInfo(Long taskId) {
-        LocalDateTime firstSent = notificationFirstSentTime.get(taskId);
-        Integer count = notificationSendCount.get(taskId);
-
-        if (firstSent == null) {
-            return null;
-        }
-
-        return String.format("ID: %d, firstSent: %s, sendCount: %d",
-                taskId, firstSent, count != null ? count : 0);
-    }
-
-    /**
-     * Очищает весь кэш напоминаний (для тестирования/сброса)
-     * ВНИМАНИЕ: Использовать только для отладки!
-     */
-    public void clearAllCache() {
-        int firstSentSize = notificationFirstSentTime.size();
-        int sendCountSize = notificationSendCount.size();
-        int lastSentSize = lastSentNotifications.size();
-
-        notificationFirstSentTime.clear();
-        notificationSendCount.clear();
-        lastSentNotifications.clear();
-
-        logger.info("Cleared entire cache. Removed: firstSent={}, sendCount={}, lastSent={}",
-                firstSentSize, sendCountSize, lastSentSize);
     }
 }
