@@ -1,0 +1,4 @@
+databaseChangeLog:
+  - include: 
+      file: /changes/create-notification-task-table.sql
+      relativeToChangelogFile: true
